@@ -283,7 +283,7 @@ local function readelf(data)
             v.section = sectionList[v.info + 1]
             local symtab = sectionList[v.link + 1].symbols
             for _, r in ipairs(v.relocations) do
-                r.symbol, r.symbolidx = symtab[r.symbolidx + 1], nil
+                r.symbol, r.symbolidx = r.symbolidx > 0 and symtab[r.symbolidx + 1] or nil, nil
             end
         end
     end

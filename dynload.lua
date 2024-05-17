@@ -1,7 +1,8 @@
 local readelf = require "elf"
 
 local function symbol(modules, baseAddress, sym)
-    if sym.shndx == 0 or sym.value == 0 then -- UNDEF
+    if not sym then return 0
+    elseif sym.shndx == 0 or sym.value == 0 then -- UNDEF
         local name = sym.name
         --print(name)
         for _, m in pairs(modules) do
@@ -29,15 +30,26 @@ local function dynload(self, modules, name, baseAddress)
     if not elf.dynamic then error("No dynamic section") end
     -- 1. Copy segments to memory
     local endAddr = baseAddress
+    local tlsAddr
     for _, v in ipairs(elf.segments) do
-        if v.type == "LOAD" then
+        if v.type == "LOAD" or v.type == "TLS" then
             ffi.copy(self.mem + baseAddress + v.address, v.data)
             endAddr = math.max(endAddr, baseAddress + v.address + #v.data)
+            if v.type == "TLS" then tlsAddr = baseAddress + v.address end
         end
+    end
+    local tlsOffset = 0
+    if tlsAddr then
+        tlsOffset = self.mem32[0x800200] + 1
+        self.mem32[0x800200] = tlsOffset
+        self.mem32[0x800200 + tlsOffset] = tlsAddr
+        tlsOffset = tlsOffset * 4
     end
     -- 2. Load dependencies
     for _, v in ipairs(elf.dynamic.needed) do
-        endAddr = dynload(self, modules, v, math.ceil(endAddr / 0x1000) * 0x1000)
+        if not modules[v] then
+            endAddr = dynload(self, modules, v, math.ceil(endAddr / 0x1000) * 0x1000)
+        end
     end
     -- 3. Process relocations
     for _, v in pairs(elf.sections) do
@@ -52,12 +64,29 @@ local function dynload(self, modules, name, baseAddress)
                 elseif r.type == 5 then -- R_RISCV_JUMP_SLOT
                     self.mem32[addr / 4] = symbol(modules, baseAddress, r.symbol)
                     --print(("%08x %08x"):format(addr, self.mem32[addr / 4]))
-                end
+                elseif r.type == 6 then -- R_RISCV_TLS_DTPMOD32
+                    self.mem32[addr / 4] = tlsOffset
+                elseif r.type == 8 then -- R_RISCV_TLS_DTPREL32
+                    self.mem32[addr / 4] = symbol(modules, baseAddress, r.symbol) + r.addend - 0x800
+                elseif r.type == 10 then -- R_RISCV_TLS_TPREL32
+                    self.mem32[addr / 4] = symbol(modules, baseAddress, r.symbol) + r.addend + tlsOffset
+                --elseif r.type == 12 then -- R_RISCV_TLSDESC
+
+                else error("Unimplemented relocation type " .. r.type) end
             end
         end
     end
     -- 4. Run array initializers
-
+    local init, initsz
+    for _, v in ipairs(elf.dynamic) do
+        if v.type == "INIT_ARRAY" then init = v.value
+        elseif v.type == "INIT_ARRAYSZ" then initsz = v.value end
+    end
+    if init and initsz then
+        for addr = baseAddress + init, baseAddress + init + initsz - 1, 4 do
+            self:call(self.mem32[addr / 4])
+        end
+    end
     -- 5. Create exported symbol table and return
     local symbols = {}
     for _, v in ipairs(elf.sections[".dynsym"].symbols) do

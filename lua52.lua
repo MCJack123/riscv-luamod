@@ -347,8 +347,12 @@ end
 function lua52:lua_gettable(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     L:push(t[L:pop()])
     return void
 end
@@ -357,8 +361,12 @@ function lua52:lua_getfield(_L, idx, _k)
     idx = signed(idx)
     local k = ffi.string(self.mem + _k)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     L:push(t[k])
     return void
 end
@@ -366,8 +374,12 @@ end
 function lua52:lua_rawget(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     L:push(rawget(t, L:pop()))
     return void
 end
@@ -375,8 +387,12 @@ end
 function lua52:lua_rawgeti(_L, idx, n)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     L:push(rawget(t, n))
     return void
 end
@@ -385,8 +401,12 @@ function lua52:lua_rawgetp(_L, idx, _p)
     idx = signed(idx)
     -- TODO
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     L:push(rawget(t, self.mem + _p))
     return void
 end
@@ -435,8 +455,12 @@ end
 function lua52:lua_settable(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     local v = L:pop()
     local k = L:pop()
     t[k] = v
@@ -447,8 +471,12 @@ function lua52:lua_setfield(_L, idx, _k)
     idx = signed(idx)
     local k = ffi.string(self.mem + _k)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     t[k] = L:pop()
     return void
 end
@@ -456,8 +484,12 @@ end
 function lua52:lua_rawset(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     local v = L:pop()
     local k = L:pop()
     rawset(t, k, v)
@@ -467,8 +499,12 @@ end
 function lua52:lua_rawseti(_L, idx, n)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     rawset(t, n, L:pop())
     return void
 end
@@ -477,8 +513,12 @@ function lua52:lua_rawsetp(_L, idx, _p)
     idx = signed(idx)
     -- TODO
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t
+    if idx == -1001000 then t = debug.getregistry()
+    else
+        if idx < 0 then idx = L.stack.n + idx + 1 end
+        t = luastate.lua_value(L.stack[idx])
+    end
     rawset(t, self.mem + _p, L:pop())
     return void
 end

@@ -1,10 +1,12 @@
 #include "lua.h"
 #include "lauxlib.h"
+#include <string.h>
+#include <errno.h>
 
 static int test_foo(lua_State *L) {
-    lua_pushinteger(L, 4);
-    lua_pushstring(L, "Hello World!");
-    return 2;
+    errno = lua_tointeger(L, 1);
+    lua_pushstring(L, strerror(errno));
+    return 1;
 }
 
 static luaL_Reg lib[] = {
