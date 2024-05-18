@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include "lua.h"
 
 #define LUA_SYSCALL 0x1b52
@@ -113,7 +114,9 @@ enum lua_call_id {
     LUA_SYSCALL_sethook,
     LUA_SYSCALL_gethook,
     LUA_SYSCALL_gethookmask,
-    LUA_SYSCALL_gethookcount
+    LUA_SYSCALL_gethookcount,
+
+    LUA_SYSCALL_strptr
 };
 
 #define LUA_FUNC_V0(name) \
@@ -195,8 +198,14 @@ LUA_FUNC_R2(lua_Unsigned, tounsignedx, int, int*)
 LUA_FUNC_R1(int, toboolean, int)
 
 LUA_API const char *lua_tolstring(lua_State *L, int idx, size_t *len) {
-    // TODO
-    return NULL;
+    size_t _len;
+    if (len == NULL) len = &_len;
+    const char* ptr = (const char*)syscall(LUA_SYSCALL, LUA_SYSCALL_strptr, L, idx, len);
+    if (ptr) return ptr;
+    ptr = malloc(*len + 1);
+    ((char*)ptr)[*len] = 0;
+    syscall(LUA_SYSCALL, LUA_SYSCALL_tolstring, L, idx, ptr);
+    return ptr;
 }
 
 LUA_FUNC_R1(size_t, rawlen, int)
@@ -242,7 +251,13 @@ LUA_FUNC_V1(rawget, int)
 LUA_FUNC_V2(rawgeti, int, int)
 LUA_FUNC_V2(rawgetp, int, const void*)
 LUA_FUNC_V2(createtable, int, int)
-LUA_FUNC_R1(void*, newuserdata, size_t)
+
+LUA_API void *lua_newuserdata(lua_State *L, size_t sz) {
+    void* ptr = malloc(sz);
+    syscall(LUA_SYSCALL, LUA_SYSCALL_newuserdata, L, ptr);
+    return ptr;
+}
+
 LUA_FUNC_R1(int, getmetatable, int)
 LUA_FUNC_V1(getuservalue, int)
 

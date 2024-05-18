@@ -555,6 +555,7 @@ function RISCV:run(cycles)
 end
 
 function RISCV:call(addr, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+    --print(("Call: %08x"):format(addr))
     local oldra = self.reg[1]
     local oldreg = {}
     local oldpc = self.pc
@@ -645,7 +646,6 @@ local function dump(cpu, modules, endAddr)
 end
 
 local function loadmodule(name)
-    local state = luastate.call_state(RISCV, "test")
     RISCV.reg[1] = 0x1FFFFFC -- return address (trap)
     RISCV.mem32[0x7FFFFF] = 0x00100073 -- EBREAK
     RISCV.reg[2] = 0x1FF0000 -- stack pointer
@@ -658,8 +658,17 @@ local function loadmodule(name)
     RISCV.endAddr = dynload(RISCV, RISCV.modules, name, 0)
     local entrypoint
     --for k, v in pairs(modules) do print(("%08x"):format(v.baseAddress), k) end
-    for k, v in pairs(RISCV.modules[name].symbols) do if k:match("^luaopen_") then --[[print(("%08x"):format(v), k)]] entrypoint = v end end
+    for k, v in pairs(RISCV.modules[name].symbols) do if k:match("^luaopen_") then entrypoint = v end end
+    if RISCV.modules["libc.so.6"] and RISCV.modules["libc.so.6"].symbols["__libc_early_init"] then
+        local ok, err = xpcall(function()
+            RISCV:call(RISCV.modules["libc.so.6"].symbols["__libc_early_init"], 1)
+        end, function(msg)
+            return msg .. "\n" .. dump(RISCV, RISCV.modules, RISCV.endAddr)
+        end)
+        if not ok then error(err) end
+    end
     local nres
+    local state = luastate.call_state(RISCV, luastate.cclosure(entrypoint), "test")
     local ok, err = xpcall(function()
         nres = RISCV:call(entrypoint, state)
     end, function(msg)
@@ -673,13 +682,14 @@ local function loadmodule(name)
 end
 
 if ... ~= "riscv" then
-    local test = loadmodule(...)
-    local ok, err = xpcall(function()
-        print(test.version())
-        print(test.crc32(os.about()))
+    local name, fn = ...
+    local test = loadmodule(name)
+    local ok, err = xpcall(function(...)
+        print(test[fn](...))
+        --print(test.crc32()(os.about()))
     end, function(msg)
         return msg .. "\n" .. dump(RISCV, RISCV.modules, RISCV.endAddr)
-    end)
+    end, select(3, ...))
     if not ok then error(err) end
     return
 end

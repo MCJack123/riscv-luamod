@@ -22,6 +22,22 @@ end
 
 local function signed(n) if n >= 0x80000000 then return n - 0x100000000 end return n end
 
+local function value(L, idx)
+    idx = signed(idx)
+    if idx == -1001000 then return debug.getregistry()
+    elseif idx < -1001000 then return L.cf and L.cf.upvalues[-idx - 1001000]
+    elseif idx < 0 then idx = L.stack.n + idx + 1 end
+    return luastate.lua_value(L.stack[idx], L.cpu)
+end
+
+local function rawvalue(L, idx)
+    idx = signed(idx)
+    if idx == -1001000 then return luastate.table(debug.getregistry())
+    elseif idx < -1001000 then return luastate.stack_value(L.cf and L.cf.upvalues[-idx - 1001000])
+    elseif idx < 0 then idx = L.stack.n + idx + 1 end
+    return L.stack[idx]
+end
+
 function lua52:lua_newstate(_allocf, _ud)
     -- not possible to create whole new states
     return NULL
@@ -61,27 +77,28 @@ function lua52:lua_gettop(_L)
 end
 
 function lua52:lua_settop(_L, idx)
-    idx = signed(idx)
-    luastate.states[_L]:settop(idx)
+    luastate.states[_L]:settop(signed(idx))
     return void
 end
 
 function lua52:lua_pushvalue(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    L:push(L.stack[idx])
+    L:rawpush(rawvalue(L, idx))
     return void
 end
 
 function lua52:lua_remove(_L, idx)
     idx = signed(idx)
-    luastate.states[_L]:remove(idx)
+    local L = luastate.states[_L]
+    if idx < 0 then idx = L.stack.n + idx + 1 end
+    L:remove(idx)
     return void
 end
 
 function lua52:lua_insert(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
+    if idx < 0 then idx = L.stack.n + idx + 1 end
     L:insert(L:pop(), idx)
     return void
 end
@@ -89,17 +106,17 @@ end
 function lua52:lua_replace(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
+    if idx < -1001000 then L.cf.upvalues[-idx - 1001000] = L:pop() return void end
     if idx < 0 then idx = L.stack.n + idx + 1 end
     L.stack[idx] = L:pop()
     return void
 end
 
 function lua52:lua_copy(_L, fromidx, toidx)
-    idx = signed(idx)
+    toidx = signed(toidx)
     local L = luastate.states[_L]
-    if fromidx < 0 then fromidx = L.stack.n + fromidx + 1 end
     if toidx < 0 then toidx = L.stack.n + toidx + 1 end
-    L.stack[toidx] = L.stack[fromidx]
+    L.stack[toidx] = rawvalue(L, fromidx)
     return void
 end
 
@@ -118,31 +135,27 @@ function lua52:lua_xmove(_from, _to, n)
 end
 
 function lua52:lua_isnumber(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    return type(L.stack[idx]) == "number" and 1 or 0
+    local v = rawvalue(L, idx)
+    return type(v) == "number" and 1 or 0
 end
 
 function lua52:lua_isstring(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    return type(L.stack[idx]) == "string" and 1 or 0
+    local v = rawvalue(L, idx)
+    return type(v) == "string" and 1 or 0
 end
 
 function lua52:lua_iscfunction(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    return (type(L.stack[idx]) == "table" and L.stack[idx].type == "cclosure") and 1 or 0
+    local v = rawvalue(L, idx)
+    return (type(v) == "table" and v.type == "cclosure") and 1 or 0
 end
 
 function lua52:lua_isuserdata(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    return (type(L.stack[idx]) == "table" and (L.stack[idx].type == "userdata" or L.stack[idx].type == "lightuserdata")) and 1 or 0
+    local v = rawvalue(L, idx)
+    return (type(v) == "table" and (v.type == "userdata" or v.type == "lightuserdata")) and 1 or 0
 end
 
 local lua_types = {
@@ -161,10 +174,10 @@ local lua_types = {
 function lua52:lua_type(_L, idx)
     idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    if idx == 0 or idx > L.stack.n then return -1
-    elseif type(L.stack[idx]) == "table" then return lua_types[L.stack[idx].type]
-    else return lua_types[type(L.stack[idx])] end
+    if idx == 0 or idx > L.stack.n or (idx < -L.stack.n and idx > -1001000) or (idx < -1001000 and L.cf.upvalues[-idx - 1001000] == nil) then return -1 end
+    local v = rawvalue(L, idx)
+    if type(v) == "table" then return lua_types[v.type]
+    else return lua_types[type(v)] end
 end
 
 function lua52:lua_typename(_L, tp)
@@ -173,10 +186,8 @@ function lua52:lua_typename(_L, tp)
 end
 
 function lua52:lua_tonumberx(_L, idx, _isnum)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local n = tonumber(luastate.lua_value(L.stack[idx]))
+    local n = tonumber(value(L, idx))
     if n then
         if _isnum ~= 0 then self.mem32[_isnum / 4] = 1 end
         return returndouble(self, n)
@@ -187,10 +198,8 @@ function lua52:lua_tonumberx(_L, idx, _isnum)
 end
 
 function lua52:lua_tointegerx(_L, idx, _isnum)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local n = tonumber(luastate.lua_value(L.stack[idx]))
+    local n = tonumber(value(L, idx))
     if n then
         if _isnum ~= 0 then self.mem32[_isnum / 4] = 1 end
         return bit32.band(n, 0xFFFFFFFF)
@@ -201,10 +210,8 @@ function lua52:lua_tointegerx(_L, idx, _isnum)
 end
 
 function lua52:lua_tounsignedx(_L, idx, _isnum)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local n = tonumber(luastate.lua_value(L.stack[idx]))
+    local n = tonumber(value(L, idx))
     if n then
         if _isnum ~= 0 then self.mem32[_isnum / 4] = 1 end
         return bit32.band(n, 0xFFFFFFFF)
@@ -215,61 +222,61 @@ function lua52:lua_tounsignedx(_L, idx, _isnum)
 end
 
 function lua52:lua_toboolean(_L, idx)
-    idx = signed(idx)
+    return value(luastate.states[_L], idx) and 1 or 0
+end
+
+function lua52:strptr(_L, idx, _len)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    return L.stack[idx] and 1 or 0
+    local v = value(L, idx)
+    -- TODO: numbers to string
+    if type(v) ~= "string" then return NULL end
+    if not L.cpu.sysdata.lua_tolstring then L.cpu.sysdata.lua_tolstring = {} end
+    L.cpu.mem32[_len / 4] = #v
+    return L.cpu.sysdata.lua_tolstring[v] or NULL
 end
 
 function lua52:lua_tolstring(_L, idx, _ptr)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
+    local v = value(L, idx)
     -- TODO: numbers to string
-    if type(L.stack[idx]) ~= "string" then return void end
-    ffi.copy(self.mem + _ptr, L.stack[idx])
+    if type(v) ~= "string" then return void end
+    ffi.copy(self.mem + _ptr, v)
     return void
 end
 
 function lua52:lua_rawlen(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local ok, res = pcall(rawlen, luastate.lua_value(L.stack[idx]))
+    local ok, res = pcall(rawlen, value(L, idx))
     if not ok then return 0 end
     return res
 end
 
 function lua52:lua_tocfunction(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    if type(L.stack[idx]) ~= "table" or L.stack[idx].type ~= "cclosure" then return NULL end
-    return L.stack[idx].value
+    local v = rawvalue(L, idx)
+    if type(v) ~= "table" or v.type ~= "cclosure" then return NULL end
+    return v.value
 end
 
 function lua52:lua_touserdata(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    if type(L.stack[idx]) ~= "table" or (L.stack[idx].type ~= "userdata" and L.stack[idx].type ~= "lightuserdata") then return NULL end
-    return L.stack[idx].value
+    local v = rawvalue(L, idx)
+    if type(v) ~= "table" or (v.type ~= "userdata" and v.type ~= "lightuserdata") then return NULL end
+    return v.value
 end
 
 function lua52:lua_tothread(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    if type(L.stack[idx]) ~= "table" or L.stack[idx].type ~= "thread" then return NULL end
-    return L.stack[idx].value
+    local v = rawvalue(L, idx)
+    if type(v) ~= "table" or v.type ~= "thread" then return NULL end
+    return v.value
 end
 
 function lua52:lua_topointer(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    if type(L.stack[idx]) ~= "table" then return NULL end
-    return tonumber(tostring(L.stack[idx]):match(": (%x+)"), 16)
+    local v = rawvalue(L, idx)
+    if type(v) ~= "table" then return NULL end
+    return tonumber(tostring(v):match(": (%x+)"), 16)
 end
 
 function lua52:lua_arith(_L, op)
@@ -318,7 +325,9 @@ end
 
 function lua52:lua_pushcclosure(_L, _fn, n)
     local L = luastate.states[_L]
-    L:rawpush(luastate.cclosure(_fn, table.unpack(L.stack, L.stack.n - n + 1, L.stack.n)))
+    local t = {table.unpack(L.stack, L.stack.n - n + 1, L.stack.n)}
+    for i = 1, n do t[i] = luastate.lua_value(t[i], L.cpu) end
+    L:rawpush(luastate.cclosure(_fn, table.unpack(t, 1, n)))
     return void
 end
 
@@ -345,68 +354,38 @@ function lua52:lua_getglobal(_L, _var)
 end
 
 function lua52:lua_gettable(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     L:push(t[L:pop()])
     return void
 end
 
 function lua52:lua_getfield(_L, idx, _k)
-    idx = signed(idx)
     local k = ffi.string(self.mem + _k)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     L:push(t[k])
     return void
 end
 
 function lua52:lua_rawget(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     L:push(rawget(t, L:pop()))
     return void
 end
 
 function lua52:lua_rawgeti(_L, idx, n)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     L:push(rawget(t, n))
     return void
 end
 
 function lua52:lua_rawgetp(_L, idx, _p)
-    idx = signed(idx)
     -- TODO
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     L:push(rawget(t, self.mem + _p))
     return void
 end
@@ -417,13 +396,15 @@ function lua52:lua_createtable(_L, narr, nrec)
     return void
 end
 
-
+function lua52:lua_newuserdata(_L, _ptr)
+    local L = luastate.states[_L]
+    L:rawpush(luastate.userdata(_ptr, nil, nil))
+    return void
+end
 
 function lua52:lua_getmetatable(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t = value(L, idx)
     local mt = debug.getmetatable(t)
     if mt ~= nil then
         L:push(mt)
@@ -434,10 +415,8 @@ end
 
 -- TODO
 function lua52:lua_getuservalue(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = L.stack[idx]
+    local t = rawvalue(L, idx)
     if type(t) == "table" then
         if t.type == "userdata" then L:push(t.uservalue)
         else L:push(nil) end
@@ -453,14 +432,8 @@ function lua52:lua_setglobal(_L, _var)
 end
 
 function lua52:lua_settable(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     local v = L:pop()
     local k = L:pop()
     t[k] = v
@@ -468,28 +441,16 @@ function lua52:lua_settable(_L, idx)
 end
 
 function lua52:lua_setfield(_L, idx, _k)
-    idx = signed(idx)
     local k = ffi.string(self.mem + _k)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     t[k] = L:pop()
     return void
 end
 
 function lua52:lua_rawset(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     local v = L:pop()
     local k = L:pop()
     rawset(t, k, v)
@@ -497,47 +458,31 @@ function lua52:lua_rawset(_L, idx)
 end
 
 function lua52:lua_rawseti(_L, idx, n)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     rawset(t, n, L:pop())
     return void
 end
 
 function lua52:lua_rawsetp(_L, idx, _p)
-    idx = signed(idx)
     -- TODO
     local L = luastate.states[_L]
-    local t
-    if idx == -1001000 then t = debug.getregistry()
-    else
-        if idx < 0 then idx = L.stack.n + idx + 1 end
-        t = luastate.lua_value(L.stack[idx])
-    end
+    local t = value(L, idx)
     rawset(t, self.mem + _p, L:pop())
     return void
 end
 
 function lua52:lua_setmetatable(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t = value(L, idx)
     debug.setmetatable(t, L:pop())
     return 1
 end
 
 -- TODO
 function lua52:lua_setuservalue(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = L.stack[idx]
+    local t = rawvalue(L, idx)
     if type(t) == "table" then
         if t.type == "userdata" then t.uservalue = L:pop()
         else L:pop() end
@@ -552,10 +497,8 @@ function lua52:lua_error(_L)
 end
 
 function lua52:lua_next(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t = value(L, idx)
     local k = L:pop()
     local nk, nv = next(t, k)
     if nk ~= nil then
@@ -574,10 +517,8 @@ function lua52:lua_concat(_L, n)
 end
 
 function lua52:lua_len(_L, idx)
-    idx = signed(idx)
     local L = luastate.states[_L]
-    if idx < 0 then idx = L.stack.n + idx + 1 end
-    local t = luastate.lua_value(L.stack[idx])
+    local t = value(L, idx)
     L:push(#t)
     return void
 end
@@ -696,7 +637,9 @@ local lua52_list = {
     "lua_sethook",
     "lua_gethook",
     "lua_gethookmask",
-    "lua_gethookcount"
+    "lua_gethookcount",
+
+    "strptr"
 }
 for k, v in pairs(lua52_list) do lua52[k] = lua52[v] end
 

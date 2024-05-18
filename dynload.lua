@@ -32,10 +32,17 @@ local function dynload(self, modules, name, baseAddress)
     local endAddr = baseAddress
     local tlsAddr
     for _, v in ipairs(elf.segments) do
-        if v.type == "LOAD" or v.type == "TLS" then
+        if v.type == "LOAD" then
             ffi.copy(self.mem + baseAddress + v.address, v.data)
             endAddr = math.max(endAddr, baseAddress + v.address + #v.data)
             if v.type == "TLS" then tlsAddr = baseAddress + v.address end
+        end
+    end
+    for _, v in ipairs(elf.segments) do
+        if v.type == "TLS" then
+            ffi.copy(self.mem + endAddr, v.data)
+            tlsAddr = endAddr
+            endAddr = endAddr + #v.data
         end
     end
     local tlsOffset = 0
@@ -69,11 +76,19 @@ local function dynload(self, modules, name, baseAddress)
                 elseif r.type == 8 then -- R_RISCV_TLS_DTPREL32
                     self.mem32[addr / 4] = symbol(modules, baseAddress, r.symbol) + r.addend - 0x800
                 elseif r.type == 10 then -- R_RISCV_TLS_TPREL32
-                    self.mem32[addr / 4] = symbol(modules, baseAddress, r.symbol) + r.addend + tlsOffset
+                    local a = symbol(modules, baseAddress, r.symbol) + r.addend + (tlsAddr - 0x2000800)
+                    if a < 0 then a = a + 0x100000000 end
+                    --print(("%s %08x %04x -> %08x"):format(name, addr, r.addend, (a + 0x2000800) % 0x100000000)) sleep(1)
+                    self.mem32[addr / 4] = a
                 --elseif r.type == 12 then -- R_RISCV_TLSDESC
-
                 else error("Unimplemented relocation type " .. r.type) end
             end
+        end
+    end
+    -- 3.5. Copy TLS data again, now with relocations
+    for _, v in ipairs(elf.segments) do
+        if v.type == "TLS" then
+            ffi.copy(self.mem + tlsAddr, self.mem + baseAddress + v.address, #v.data)
         end
     end
     -- 4. Run array initializers

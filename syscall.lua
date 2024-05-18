@@ -8,9 +8,16 @@ function syscalls:close(fd)
     return 0
 end
 
+function syscalls:brk(brk)
+    if not self.sysdata.brk then self.sysdata.brk = self.endAddr end
+    local old = self.sysdata.brk
+    self.sysdata.brk = math.min(brk, 0x1FF0000)
+    return old
+end
+
 function syscalls:mmap2(addr, length, prot, flags, fd, pgoffset)
     if not self.sysdata.mmap then
-        self.sysdata.mmap = {base = self.endAddr, mapped = {}}
+        self.sysdata.mmap = {base = self.endAddr, mapped = {[0x1FFE] = true, [0x1FFF] = true, [0x2000] = true}}
         for a = 0, self.endAddr, 4096 do self.sysdata.mmap.mapped[a / 4096] = true end
     end
     if addr == 0 then addr = self.sysdata.mmap.base end
@@ -19,6 +26,15 @@ function syscalls:mmap2(addr, length, prot, flags, fd, pgoffset)
     for a = addr, addr + length - 1, 4096 do self.sysdata.mmap.mapped[a / 4096] = true end
     -- TODO: fd
     return addr
+end
+
+function syscalls:prlimit64(pid, resource, _new_rlim, _old_rlim)
+    if resource == 1 then return fs.getCapacity()
+    elseif resource == 6 then return 1
+    elseif resource == 7 then return 128
+    elseif resource == 9 then return 0x2000000
+    elseif resource == 13 then return 39
+    else return 0x7FFFFFFF end
 end
 
 function syscalls:getrandom(_buf, len, flags)
@@ -38,7 +54,9 @@ end
 local syscall_list = {
     [56] = "openat",
     [57] = "close",
+    [214] = "brk",
     [222] = "mmap2",
+    [261] = "prlimit64",
     [278] = "getrandom",
     [0x1b52] = "lua52"
 }

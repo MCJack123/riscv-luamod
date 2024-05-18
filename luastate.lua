@@ -43,9 +43,10 @@ function State:remove(i)
     self.stack.n = self.stack.n - 1
 end
 
-function luastate.call_state(cpu, ...)
+function luastate.call_state(cpu, cf, ...)
     local state = setmetatable({
         cpu = cpu,
+        cf = cf,
         coro = coroutine.running(),
         stack = table.pack(...)
     }, State)
@@ -78,7 +79,7 @@ function luastate.cclosure(_ptr, ...)
 end
 
 function luastate.userdata(_ptr, mt, uv)
-    return {type = "userdata", value = _ptr, metatable = mt, uservalue = uv}
+    return {type = "userdata", value = _ptr, object = setmetatable({}, mt), uservalue = uv}
 end
 
 function luastate.lightuserdata(_ptr)
@@ -106,15 +107,15 @@ function luastate.lua_value(v, cpu)
         elseif v.type == "thread" then return luastate.states[v.value].coro
         elseif v.type == "cclosure" then
             return function(...)
-                local state = luastate.call_state(cpu, ...)
+                local state = luastate.call_state(cpu, v, ...)
                 local nres = cpu:call(v.value, state)
                 local st = luastate.states[state].stack
                 for i = st.n - nres + 1, st.n do st[i] = luastate.lua_value(st[i], cpu) end
                 luastate.states[state] = nil
                 return table.unpack(st, st.n - nres + 1, st.n)
             end
-        elseif v.type == "userdata" then return nil -- TODO
-        elseif v.type == "lightuserdata" then return nil -- TODO
+        elseif v.type == "userdata" then return v.object
+        elseif v.type == "lightuserdata" then return v -- TODO
         end
     else return v end
 end

@@ -4,7 +4,10 @@ AR=$(TRIPLET)ar
 RANLIB=$(TRIPLET)ranlib
 CFLAGS=
 
-testmod.so: testmod.c lua52.a
+testmod.so: testmod.c lua52.so
+	$(CC) -fPIC -shared $(CFLAGS) -o $@ $^
+
+lua52.so: lua52.o lauxlib.o
 	$(CC) -fPIC -shared $(CFLAGS) -o $@ $^
 
 lua52.a: lua52.o lauxlib.o
@@ -13,4 +16,4 @@ lua52.a: lua52.o lauxlib.o
 	$(RANLIB) $@
 
 %.o: %.c
-	$(CC) -fPIC $(CFLAGS) -o $@ $<
+	$(CC)  -fPIC $(CFLAGS) -c -o $@ $<

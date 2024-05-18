@@ -237,7 +237,7 @@ local function readelf(data)
             section.relocations = {}
             local t = sectionHeader.sh_type == 9 and types.elf_relocation_t or types.elf_relocation_addend_t
             local p, j = 1, 1
-            while p + (sectionHeader.sh_type == 4 and 12 or 8) <= #section.data do
+            while p < #section.data do
                 local relData
                 relData, p = t(section.data, p)
                 section.relocations[j] = {
