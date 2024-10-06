@@ -33,14 +33,14 @@ local function dynload(self, modules, name, baseAddress)
     local tlsAddr
     for _, v in ipairs(elf.segments) do
         if v.type == "LOAD" then
-            ffi.copy(self.mem + baseAddress + v.address, v.data)
+            self.fficopy(self.mem + baseAddress + v.address, v.data)
             endAddr = math.max(endAddr, baseAddress + v.address + #v.data)
             if v.type == "TLS" then tlsAddr = baseAddress + v.address end
         end
     end
     for _, v in ipairs(elf.segments) do
         if v.type == "TLS" then
-            ffi.copy(self.mem + endAddr, v.data)
+            self.fficopy(self.mem + endAddr, v.data)
             tlsAddr = endAddr
             endAddr = endAddr + #v.data
         end
@@ -88,7 +88,7 @@ local function dynload(self, modules, name, baseAddress)
     -- 3.5. Copy TLS data again, now with relocations
     for _, v in ipairs(elf.segments) do
         if v.type == "TLS" then
-            ffi.copy(self.mem + tlsAddr, self.mem + baseAddress + v.address, #v.data)
+            self.fficopy(self.mem + tlsAddr, self.mem + baseAddress + v.address, #v.data)
         end
     end
     -- 4. Run array initializers

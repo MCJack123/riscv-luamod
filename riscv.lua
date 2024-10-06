@@ -1,15 +1,67 @@
 -- Licensed under GPLv2
-if not ffi then error("Requires FFI library on LuaJIT, enable jit_ffi_enable in config/global.json") end
 local RISCV = {reg = {}, pc = 0, syscalls = require "syscall", opcodes = {[0x63] = {}, [0x03] = {}, [0x23] = {}, [0x13] = {}, [0x33] = {}, [0x2F] = {[2] = true}}, mult_opcodes = {}, atomic_opcodes = {}, atomic_rs = {}, halt = false, sysdata = {}}
 for i = 1, 31 do RISCV.reg[i] = 0 end
 setmetatable(RISCV.reg, {__index = function() return 0 end, __newindex = function() end})
-RISCV.mem = ffi.new("uint8_t[?]", 0x2010000)
-RISCV.mem16 = ffi.cast("uint16_t*", RISCV.mem)
-RISCV.mem32 = ffi.cast("uint32_t*", RISCV.mem)
-
-local function signed(num)
-    if bit32.btest(num, 0x80000000) then return num - 0x100000000 end
-    return num
+if ffi then
+    print("Using FFI acceleration")
+    RISCV.mem = ffi.new("uint8_t[?]", 0x2010000)
+    RISCV.mem16 = ffi.cast("uint16_t*", RISCV.mem)
+    RISCV.mem32 = ffi.cast("uint32_t*", RISCV.mem)
+    RISCV.fficopy, RISCV.ffistring = ffi.copy, ffi.string
+else
+    local function __add(self, offset)
+        return setmetatable({}, {
+            __index = function(_, idx) return self[offset+idx] end,
+            __newindex = function(_, idx, val) self[offset+idx] = val end,
+            __add = __add
+        })
+    end
+    RISCV.mem = setmetatable({}, {
+        __index = function() return 0 end,
+        __add = __add
+    })
+    RISCV.mem16 = setmetatable({}, {
+        __index = function(_, idx) return RISCV.mem[idx*2] + RISCV.mem[idx*2+1] * 256 end,
+        __newindex = function(_, idx, val)
+            RISCV.mem[idx*2] = bit32.extract(val, 0, 8)
+            RISCV.mem[idx*2+1] = bit32.extract(val, 8, 8)
+        end,
+        __add = __add
+    })
+    RISCV.mem32 = setmetatable({}, {
+        __index = function(_, idx) return RISCV.mem[idx*4] + RISCV.mem[idx*4+1] * 256 + RISCV.mem[idx*4+2] * 65536 + RISCV.mem[idx*4+3] * 16777216 end,
+        __newindex = function(_, idx, val)
+            RISCV.mem[idx*4] = bit32.extract(val, 0, 8)
+            RISCV.mem[idx*4+1] = bit32.extract(val, 8, 8)
+            RISCV.mem[idx*4+2] = bit32.extract(val, 16, 8)
+            RISCV.mem[idx*4+3] = bit32.extract(val, 24, 8)
+        end,
+        __add = __add
+    })
+    function RISCV.fficopy(dest, src, size)
+        if type(src) == "string" then
+            for i, c in src:gmatch "()(.)" do
+                dest[i-1] = c:byte()
+            end
+        else
+            for i = 0, size - 1 do
+                dest[i] = src[i]
+            end
+        end
+    end
+    function RISCV.ffistring(ptr, size)
+        local retval = ""
+        if size then
+            for i = 0, size - 1 do retval = retval .. string.char(ptr[i]) end
+        else
+            for i = 0, math.huge do
+                local c = ptr[i]
+                if c == 0 then break end
+                retval = retval .. string.char(c)
+            end
+        end
+        return retval
+    end
 end
 
 local function fiximm(bits) return function(inst)
@@ -106,456 +158,588 @@ local opcode_modes = {
     [0x2F] = decodeR, -- atomic
 }
 
-RISCV.opcodes[0x37] = function(self, inst) -- LUI
-    self.reg[inst.rd] = inst.imm
-    return "LUI x" .. inst.rd .. ", " .. inst.imm
+RISCV.opcodes[0x37] = function(pc, inst) -- LUI
+    return ([[
+        -- %08X: LUI
+        self.reg[%d] = %d
+    ]]):format(pc, inst.rd, inst.imm)
 end
 
-RISCV.opcodes[0x17] = function(self, inst) -- AUIPC
-    self.reg[inst.rd] = (self.pc - 4 + inst.imm) % 0x100000000
-    return "AUIPC x" .. inst.rd .. ", " .. inst.imm
+RISCV.opcodes[0x17] = function(pc, inst) -- AUIPC
+    return ([[
+        -- %08X: AUIPC
+        self.reg[%d] = %d
+    ]]):format(pc, inst.rd, (pc - 4 + inst.imm) % 0x100000000)
 end
 
-RISCV.opcodes[0x6F] = function(self, inst) -- JAL
-    self.reg[inst.rd] = self.pc
-    self.pc = self.pc + inst.simm - 4
-    if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    return "JAL x" .. inst.rd .. ", " .. inst.simm
+RISCV.opcodes[0x6F] = function(pc, inst) -- JAL
+    if (pc + inst.simm - 4) % 4 ~= 0 then error("unaligned jump to " .. (pc + inst.simm - 4)) end
+    return ([[
+        -- %08X: JAL
+        self.reg[%d] = %d
+        return self.traces[%d](self)
+    ]]):format(pc, inst.rd, pc, pc + inst.simm - 4), true
 end
 
-RISCV.opcodes[0x67] = function(self, inst) -- JALR
-    local oldpc = self.pc
-    self.pc = bit32.band(self.reg[inst.rs1] + inst.simm, 0xFFFFFFFE)
-    self.reg[inst.rd] = oldpc
-    if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    return "JALR x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x67] = function(pc, inst) -- JALR
+    return ([[
+        -- %08X: JALR
+        local pc = bit32.band(self.reg[%d] + %d, 0xFFFFFFFE)
+        self.reg[%d] = %d
+        return self.traces[pc](self)
+    ]]):format(pc, inst.rs1, inst.simm, inst.rd, pc), true
 end
 
-RISCV.opcodes[0x63][0] = function(self, inst) -- BEQ
-    if self.reg[inst.rs1] == self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
+RISCV.opcodes[0x63][0] = function(pc, inst) -- BEQ
+    return ([[
+        -- %08X: BEQ
+        if self.reg[%d] == self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(pc, inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][1] = function(pc, inst) -- BNE
+    return ([[
+        -- %08X: BNE
+        if self.reg[%d] ~= self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(pc, inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][4] = function(pc, inst) -- BLT
+    return ([[
+        -- %08X: BLT
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        if ra < rb then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(pc, inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][5] = function(pc, inst) -- BGE
+    return ([[
+        -- %08X: BGE
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        if ra >= rb then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(pc, inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][6] = function(pc, inst) -- BLTU
+    return ([[
+        -- %08X: BLTU
+        if self.reg[%d] < self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(pc, inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][7] = function(pc, inst) -- BGEU
+    return ([[
+        -- %08X: BGEU
+        if self.reg[%d] >= self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(pc, inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x03][0] = function(pc, inst) -- LB
+    return ([[
+        -- %08X: LB
+        self.reg[%d] = self.mem[self.reg[%d] + %d]
+        if self.reg[%d] >= 0x80 then self.reg[%d] = self.reg[%d] + 0xFFFFFF00 end
+    ]]):format(pc, inst.rd, inst.rs1, inst.simm, inst.rd, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x03][1] = function(pc, inst) -- LH
+    return ([[
+        -- %08X: LH
+        local addr = self.reg[%d] + %d
+        if addr %% 2 ~= 0 then self.reg[%d] = self.mem[addr] + self.mem[addr+1] * 256
+        else self.reg[%d] = self.mem16[addr / 2] end
+        if self.reg[%d] >= 0x8000 then self.reg[%d] = self.reg[%d] + 0xFFFF0000 end
+    ]]):format(pc, inst.rs1, inst.simm, inst.rd, inst.rd, inst.rd, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x03][2] = function(pc, inst) -- LW
+    return ([[
+        -- %08X: LW
+        local addr = self.reg[%d] + %d
+        if addr %% 4 ~= 0 then self.reg[%d] = self.mem[addr] + self.mem[addr+1] * 256 + self.mem[addr+2] * 65536 + self.mem[addr+3] * 16777216
+        else self.reg[%d] = self.mem32[addr / 4] end
+    ]]):format(pc, inst.rs1, inst.simm, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x03][4] = function(pc, inst) -- LBU
+    return ([[
+        -- %08X: LBU
+        self.reg[%d] = self.mem[self.reg[%d] + %d]
+    ]]):format(pc, inst.rd, inst.rs1, inst.simm)
+end
+
+RISCV.opcodes[0x03][5] = function(pc, inst) -- LHU
+    return ([[
+        -- %08X: LHU
+        local addr = self.reg[%d] + %d
+        if addr %% 2 ~= 0 then self.reg[%d] = self.mem[addr] + self.mem[addr+1] * 256
+        else self.reg[%d] = self.mem16[addr / 2] end
+    ]]):format(pc, inst.rs1, inst.simm, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x23][0] = function(pc, inst) -- SB
+    return ([[
+        -- %08X: SB
+        self.mem[self.reg[%d] + %d] = self.reg[%d] %% 256
+    ]]):format(pc, inst.rs1, inst.simm, inst.rs2)
+end
+
+RISCV.opcodes[0x23][1] = function(pc, inst) -- SH
+    return ([[
+        -- %08X: SH
+        local addr = self.reg[%d] + %d
+        if addr %% 2 ~= 0 then
+            self.mem[addr] = bit32.extract(self.reg[%d], 0, 8)
+            self.mem[addr+1] = bit32.extract(self.reg[%d], 8, 8)
+        else self.mem16[addr / 2] = self.reg[%d] %% 65536 end
+    ]]):format(pc, inst.rs1, inst.simm, inst.rs2, inst.rs2, inst.rs2)
+end
+
+RISCV.opcodes[0x23][2] = function(pc, inst) -- SW
+    return ([[
+        -- %08X: SW
+        local addr = self.reg[%d] + %d
+        if addr %% 4 ~= 0 then
+            self.mem[addr] = bit32.extract(self.reg[%d], 0, 8)
+            self.mem[addr+1] = bit32.extract(self.reg[%d], 8, 8)
+            self.mem[addr+2] = bit32.extract(self.reg[%d], 16, 8)
+            self.mem[addr+3] = bit32.extract(self.reg[%d], 24, 8)
+        else self.mem32[addr / 4] = self.reg[%d] end
+    ]]):format(pc, inst.rs1, inst.simm, inst.rs2, inst.rs2, inst.rs2, inst.rs2, inst.rs2)
+end
+
+RISCV.opcodes[0x13][0] = function(pc, inst) -- ADDI
+    if inst.rs1 == 0 then
+        return ([[
+        -- %08X: LI
+        self.reg[%d] = %d
+        ]]):format(pc, inst.rd, inst.simm % 0x100000000)
+    elseif inst.simm == 0 then
+        return ([[
+        -- %08X: MR
+        self.reg[%d] = self.reg[%d]
+        ]]):format(pc, inst.rd, inst.rs1)
+    else
+        return ([[
+        -- %08X: ADDI
+        self.reg[%d] = (self.reg[%d] + %d) %% 0x100000000
+        ]]):format(pc, inst.rd, inst.rs1, inst.simm)
     end
-    return "BEQ x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
 end
 
-RISCV.opcodes[0x63][1] = function(self, inst) -- BNE
-    if self.reg[inst.rs1] ~= self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BNE x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
+RISCV.opcodes[0x13][2] = function(pc, inst) -- SLTI
+    return ([[
+        -- %08X: SLTI
+        local rs = self.reg[%d]
+        if rs >= 0x80000000 then rs = rs - 0x100000000 end
+        self.reg[%d] = rs < %d and 1 or 0
+    ]]):format(pc, inst.rs1, inst.rd, inst.simm)
 end
 
-RISCV.opcodes[0x63][4] = function(self, inst) -- BLT
-    if signed(self.reg[inst.rs1]) < signed(self.reg[inst.rs2]) then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BLT x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x63][5] = function(self, inst) -- BGE
-    if signed(self.reg[inst.rs1]) >= signed(self.reg[inst.rs2]) then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BGE x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x63][6] = function(self, inst) -- BLTU
-    if self.reg[inst.rs1] < self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BLTU x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x63][7] = function(self, inst) -- BGEU
-    if self.reg[inst.rs1] >= self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BGEU x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][0] = function(self, inst) -- LB
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    self.reg[inst.rd] = self.mem[self.reg[inst.rs1] + inst.simm]
-    if bit32.btest(self.reg[inst.rd], 0x80) then self.reg[inst.rd] = bit32.bor(self.reg[inst.rd], 0xFFFFFF00) end
-    return "LB x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][1] = function(self, inst) -- LH
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 2 ~= 0 then self.reg[inst.rd] = self.mem[addr] + self.mem[addr+1] * 256
-    else self.reg[inst.rd] = self.mem16[addr / 2] end
-    if bit32.btest(self.reg[inst.rd], 0x8000) then self.reg[inst.rd] = bit32.bor(self.reg[inst.rd], 0xFFFF0000) end
-    return "LH x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][2] = function(self, inst) -- LW
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then self.reg[inst.rd] = self.mem[addr] + self.mem[addr+1] * 256 + self.mem[addr+2] * 65536 + self.mem[addr+3] * 16777216
-    else self.reg[inst.rd] = self.mem32[addr / 4] end
-    return "LW x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][4] = function(self, inst) -- LBU
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    self.reg[inst.rd] = self.mem[addr]
-    return "LBU x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][5] = function(self, inst) -- LHU
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 2 ~= 0 then self.reg[inst.rd] = self.mem[addr] + self.mem[addr+1] * 256
-    else self.reg[inst.rd] = self.mem16[addr / 2] end
-    return "LHU x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x23][0] = function(self, inst) -- SB
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds write at %08x"):format(addr)) end
-    self.mem[addr] = bit32.band(self.reg[inst.rs2], 0xFF)
-    self.atomic_rs[math.floor(addr / 4)] = nil
-    return "SB x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x23][1] = function(self, inst) -- SH
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds write at %08x"):format(addr)) end
-    if addr % 2 ~= 0 then
-        self.mem[addr] = bit32.extract(self.reg[inst.rs2], 0, 8)
-        self.mem[addr+1] = bit32.extract(self.reg[inst.rs2], 8, 8)
-    else self.mem16[addr / 2] = bit32.band(self.reg[inst.rs2], 0xFFFF) end
-    self.atomic_rs[math.floor(addr / 4)] = nil
-    self.atomic_rs[math.floor((addr + 1) / 4)] = nil
-    return "SH x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x23][2] = function(self, inst) -- SW
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr < 0 then addr = addr + 0x100000000 end
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds write at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then
-        self.mem[addr] = bit32.extract(self.reg[inst.rs2], 0, 8)
-        self.mem[addr+1] = bit32.extract(self.reg[inst.rs2], 8, 8)
-        self.mem[addr+2] = bit32.extract(self.reg[inst.rs2], 16, 8)
-        self.mem[addr+3] = bit32.extract(self.reg[inst.rs2], 24, 8)
-    else self.mem32[addr / 4] = self.reg[inst.rs2] end
-    self.atomic_rs[math.floor(addr / 4)] = nil
-    self.atomic_rs[math.floor((addr + 3) / 4)] = nil
-    return "SW x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x13][0] = function(self, inst) -- ADDI
-    local v = (self.reg[inst.rs1] + inst.simm) % 0x100000000
-    if v < 0 then v = v + 0x100000000 end
-    self.reg[inst.rd] = v
-    return "ADDI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x13][2] = function(self, inst) -- SLTI
-    self.reg[inst.rd] = signed(self.reg[inst.rs1]) < inst.simm and 1 or 0
-    return "SLTI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
-end
-
-RISCV.opcodes[0x13][3] = function(self, inst) -- SLTIU
+RISCV.opcodes[0x13][3] = function(pc, inst) -- SLTIU
     local imm = inst.simm
     if imm < 0 then imm = imm + 0x100000000 end
-    self.reg[inst.rd] = self.reg[inst.rs1] < imm and 1 or 0
-    return "SLTIU x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
+    return ([[
+        -- %08X: SLTIU
+        self.reg[%d] = self.reg[%d] < %d and 1 or 0
+    ]]):format(pc, inst.rd, inst.rs1, imm)
 end
 
-RISCV.opcodes[0x13][4] = function(self, inst) -- XORI
-    self.reg[inst.rd] = bit32.bxor(self.reg[inst.rs1], inst.simm)
-    return "XORI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x13][4] = function(pc, inst) -- XORI
+    return ([[
+        -- %08X: XORI
+        self.reg[%d] = bit32.bxor(self.reg[%d], %d)
+    ]]):format(pc, inst.rd, inst.rs1, inst.simm % 0x100000000)
 end
 
-RISCV.opcodes[0x13][6] = function(self, inst) -- ORI
-    self.reg[inst.rd] = bit32.bor(self.reg[inst.rs1], inst.simm)
-    return "ORI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x13][6] = function(pc, inst) -- ORI
+    return ([[
+        -- %08X: ORI
+        self.reg[%d] = bit32.bor(self.reg[%d], %d)
+    ]]):format(pc, inst.rd, inst.rs1, inst.simm % 0x100000000)
 end
 
-RISCV.opcodes[0x13][7] = function(self, inst) -- ANDI
-    self.reg[inst.rd] = bit32.band(self.reg[inst.rs1], inst.simm)
-    return "ANDI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x13][7] = function(pc, inst) -- ANDI
+    return ([[
+        -- %08X: ANDI
+        self.reg[%d] = bit32.band(self.reg[%d], %d)
+    ]]):format(pc, inst.rd, inst.rs1, inst.simm % 0x100000000)
 end
 
-RISCV.opcodes[0x13][1] = function(self, inst) -- SLLI
-    self.reg[inst.rd] = bit32.lshift(self.reg[inst.rs1], bit32.band(inst.imm, 0x1F))
-    return "SLLI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
+RISCV.opcodes[0x13][1] = function(pc, inst) -- SLLI
+    return ([[
+        -- %08X: SLLI
+        self.reg[%d] = bit32.lshift(self.reg[%d], %d)
+    ]]):format(pc, inst.rd, inst.rs1, bit32.band(inst.imm, 0x1F))
 end
 
-RISCV.opcodes[0x13][5] = function(self, inst) -- SRLI/SRAI
-    self.reg[inst.rd] = (bit32.btest(inst.imm, 0x400) and bit32.arshift or bit32.rshift)(self.reg[inst.rs1], bit32.band(inst.imm, 0x1F))
-    return "SRLI/SRAI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
+RISCV.opcodes[0x13][5] = function(pc, inst) -- SRLI/SRAI
+    return ([[
+        -- %08X: SRLI/SRAI
+        self.reg[%d] = bit32.%srshift(self.reg[%d], %d)
+    ]]):format(pc, inst.rd, bit32.btest(inst.imm, 0x400) and "a" or "", inst.rs1, bit32.band(inst.imm, 0x1F))
 end
 
-RISCV.opcodes[0x33][0] = function(self, inst) -- ADD/SUB
-    if bit32.btest(inst.funct7, 0x20) then self.reg[inst.rd] = (self.reg[inst.rs1] - self.reg[inst.rs2]) % 0x100000000
-    else self.reg[inst.rd] = (self.reg[inst.rs1] + self.reg[inst.rs2]) % 0x100000000 end
-    return "ADD/SUB x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][0] = function(pc, inst) -- ADD/SUB
+    return ([[
+        -- %08X: ADD/SUB
+        self.reg[%d] = (self.reg[%d] %s self.reg[%d]) %% 0x100000000
+    ]]):format(pc, inst.rd, inst.rs1, bit32.btest(inst.funct7, 0x20) and "-" or "+", inst.rs2)
 end
 
-RISCV.opcodes[0x33][1] = function(self, inst) -- SLL
-    self.reg[inst.rd] = bit32.lshift(self.reg[inst.rs1], bit32.band(self.reg[inst.rs2], 0x1F))
-    return "SLL x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][1] = function(pc, inst) -- SLL
+    return ([[
+        -- %08X: SLL
+        self.reg[%d] = bit32.lshift(self.reg[%d], bit32.band(self.reg[%d], 0x1F))
+    ]]):format(pc, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][2] = function(self, inst) -- SLT
-    self.reg[inst.rd] = signed(self.reg[inst.rs1]) < signed(self.reg[inst.rs2]) and 1 or 0
-    return "SLT x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][2] = function(pc, inst) -- SLT
+    return ([[
+        -- %08X: SLT
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        self.reg[%d] = ra < rb and 1 or 0
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.opcodes[0x33][3] = function(self, inst) -- SLTU
-    self.reg[inst.rd] = self.reg[inst.rs1] < self.reg[inst.rs2] and 1 or 0
-    return "SLTU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][3] = function(pc, inst) -- SLTU
+    return ([[
+        -- %08X: SLTU
+        self.reg[%d] = self.reg[%d] < self.reg[%d] and 1 or 0
+    ]]):format(pc, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][4] = function(self, inst) -- XOR
-    self.reg[inst.rd] = bit32.bxor(self.reg[inst.rs1], self.reg[inst.rs2])
-    return "XOR x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][4] = function(pc, inst) -- XOR
+    return ([[
+        -- %08X: XOR
+        self.reg[%d] = bit32.bxor(self.reg[%d], self.reg[%d])
+    ]]):format(pc, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][5] = function(self, inst) -- SRL/SRA
-    self.reg[inst.rd] = (bit32.btest(inst.funct7, 0x20) and bit32.arshift or bit32.rshift)(self.reg[inst.rs1], bit32.band(self.reg[inst.rs2], 0x1F))
-    return "SRL/SRA x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][5] = function(pc, inst) -- SRL/SRA
+    return ([[
+        -- %08X: SRL/SRA
+        self.reg[%d] = bit32.%srshift(self.reg[%d], bit32.band(self.reg[%d], 0x1F))
+    ]]):format(pc, inst.rd, bit32.btest(inst.funct7, 0x20) and "a" or "", inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][6] = function(self, inst) -- OR
-    self.reg[inst.rd] = bit32.bor(self.reg[inst.rs1], self.reg[inst.rs2])
-    return "OR x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][6] = function(pc, inst) -- OR
+    return ([[
+        -- %08X: OR
+        self.reg[%d] = bit32.bor(self.reg[%d], self.reg[%d])
+    ]]):format(pc, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][7] = function(self, inst) -- AND
-    self.reg[inst.rd] = bit32.band(self.reg[inst.rs1], self.reg[inst.rs2])
-    return "AND x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][7] = function(pc, inst) -- AND
+    return ([[
+        -- %08X: AND
+        self.reg[%d] = bit32.band(self.reg[%d], self.reg[%d])
+    ]]):format(pc, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x0F] = function(self, inst) -- FENCE
-    -- do nothing, only one hart
-    return "FENCE"
+RISCV.opcodes[0x0F] = function(pc, inst) -- FENCE
+    -- do nothing
+    return ("-- %08X: FENCE\n"):format(pc)
 end
 
-RISCV.opcodes[0x73] = function(self, inst) -- ECALL/EBREAK
-    if inst.imm == 1 then self.halt = true return "EBREAK" end
-    if self.syscalls[self.reg[17]] then self.reg[10] = self.syscalls[self.reg[17]](self, table.unpack(self.reg, 10, 16))
-    else error("Unimplemented syscall " .. self.reg[17]) self.reg[10] = 0xFFFFFFFF end -- ENOSYS
-    return "ECALL " .. self.reg[17]
+RISCV.opcodes[0x73] = function(pc, inst) -- ECALL/EBREAK
+    if inst.funct3 ~= 0 then return ("-- %08X: ECALL Zicsr\n"):format(pc) end -- Zicsr not implemented
+    if inst.imm == 0 then return [=[
+        if self.syscalls[self.reg[17]] then self.reg[10] = self.syscalls[self.reg[17]](self, table.unpack(self.reg, 10, 16)) end
+        if self.halt then return end
+    ]=]
+    elseif inst.imm == 0x302 then return [=[
+        return self.traces[self.reg[5]](self)
+    ]=], true end
 end
 
-RISCV.mult_opcodes[0] = function(self, inst) -- MUL
-    self.reg[inst.rd] = math.abs((signed(self.reg[inst.rs1]) * signed(self.reg[inst.rs2])) % 0x100000000)
-    return "MUL x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[0] = function(pc, inst) -- MUL
+    return ([[
+        -- %08X: MUL
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        self.reg[%d] = math.abs((ra * rb) %% 0x100000000)
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.mult_opcodes[3] = function(self, inst) -- MULHU
-    self.reg[inst.rd] = math.floor((self.reg[inst.rs1] * self.reg[inst.rs2]) / 0x100000000)
-    return "MULH x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[3] = function(pc, inst) -- MULHU
+    return ([[
+        -- %08X: MULHU
+        self.reg[%d] = math.floor((self.reg[%d] * self.reg[%d]) / 0x100000000)
+    ]]):format(pc, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.mult_opcodes[2] = function(self, inst) -- MULHSU
-    self.reg[inst.rd] = math.floor((signed(self.reg[inst.rs1]) * self.reg[inst.rs2]) / 0x100000000)
-    if self.reg[inst.rd] < 0 then self.reg[inst.rd] = self.reg[inst.rd] + 0x100000000 end
-    return "MULHSU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[2] = function(pc, inst) -- MULHSU
+    return ([[
+        -- %08X: MULHSU
+        local ra = self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        local rd = math.floor((ra * self.reg[%d]) / 0x100000000)
+        if rd < 0 then rd = rd + 0x100000000 end
+        self.reg[%d] = rd
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.mult_opcodes[1] = function(self, inst) -- MULH
-    self.reg[inst.rd] = math.floor((signed(self.reg[inst.rs1]) * signed(self.reg[inst.rs2])) / 0x100000000)
-    if self.reg[inst.rd] < 0 then self.reg[inst.rd] = self.reg[inst.rd] + 0x100000000 end
-    return "MULHU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[1] = function(pc, inst) -- MULH
+    return ([[
+        -- %08X: MULH
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        local rd = math.floor((ra * rb) / 0x100000000)
+        if rd < 0 then rd = rd + 0x100000000 end
+        self.reg[%d] = rd
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.mult_opcodes[4] = function(self, inst) -- DIV
-    if self.reg[inst.rs2] == 0 then
-        self.reg[inst.rd] = 0xFFFFFFFF
-    else
-        local res = signed(self.reg[inst.rs1]) / signed(self.reg[inst.rs2])
-        if res < 0 then self.reg[inst.rd] = math.ceil(res) + 0x100000000
-        else self.reg[inst.rd] = math.floor(res) end
-    end
-    return "DIV x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[4] = function(pc, inst) -- DIV
+    return ([[
+        -- %08X: DIV
+        if self.reg[%d] == 0 then
+            self.reg[%d] = 0xFFFFFFFF
+        else
+            local ra, rb = self.reg[%d], self.reg[%d]
+            if ra >= 0x80000000 then ra = ra - 0x100000000 end
+            if rb >= 0x80000000 then rb = rb - 0x100000000 end
+            local res = ra / rb
+            if res < 0 then self.reg[%d] = math.ceil(res) + 0x100000000
+            else self.reg[%d] = math.floor(res) end
+        end
+    ]]):format(pc, inst.rs2, inst.rd, inst.rs1, inst.rs2, inst.rd, inst.rd)
 end
 
-RISCV.mult_opcodes[5] = function(self, inst) -- DIVU
-    if self.reg[inst.rs2] == 0 then self.reg[inst.rd] = 0xFFFFFFFF
-    else self.reg[inst.rd] = math.floor(self.reg[inst.rs1] / self.reg[inst.rs2]) end
-    return "DIVU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[5] = function(pc, inst) -- DIVU
+    return ([[
+        -- %08X: DIVU
+        if self.reg[%d] == 0 then self.reg[%d] = 0xFFFFFFFF
+        else self.reg[%d] = math.floor(self.reg[%d] / self.reg[%d]) end
+    ]]):format(pc, inst.rs2, inst.rd, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.mult_opcodes[6] = function(self, inst) -- REM
-    if self.reg[inst.rs2] == 0 then
-        self.reg[inst.rd] = self.reg[inst.rs1]
-    else
-        local res = math.fmod(signed(self.reg[inst.rs1]), signed(self.reg[inst.rs2]))
-        if res < 0 then self.reg[inst.rd] = math.ceil(res) + 0x100000000
-        else self.reg[inst.rd] = math.floor(res) end
-    end
-    return "REM x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[6] = function(pc, inst) -- REM
+    return ([[
+        -- %08X: REM
+        if self.reg[%d] == 0 then
+            self.reg[%d] = self.reg[%d]
+        else
+            local ra, rb = self.reg[%d], self.reg[%d]
+            if ra >= 0x80000000 then ra = ra - 0x100000000 end
+            if rb >= 0x80000000 then rb = rb - 0x100000000 end
+            local res = math.fmod(ra, rb)
+            if res < 0 then self.reg[%d] = math.ceil(res) + 0x100000000
+            else self.reg[%d] = math.floor(res) end
+        end
+    ]]):format(pc, inst.rs2, inst.rd, inst.rs1, inst.rs1, inst.rs2, inst.rd, inst.rd)
 end
 
-RISCV.mult_opcodes[7] = function(self, inst) -- REMU
-    if self.reg[inst.rs2] == 0 then self.reg[inst.rd] = self.reg[inst.rs1]
-    else self.reg[inst.rd] = self.reg[inst.rs1] % self.reg[inst.rs2] end
-    return "REMU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[7] = function(pc, inst) -- REMU
+    return ([[
+        -- %08X: REMU
+        if self.reg[%d] == 0 then self.reg[%d] = self.reg[%d]
+        else self.reg[%d] = self.reg[%d] %% self.reg[%d] end
+    ]]):format(pc, inst.rs2, inst.rd, inst.rs1, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.atomic_opcodes[0] = function(self, inst) -- AMOADD.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = (val + self.reg[inst.rs2]) % 0x100000000
-    return "AMOADD.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[0] = function(pc, inst) -- AMOADD.W
+    return ([[
+        -- %08X: AMOADD.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val = self.mem32[addr / 4]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = (val + self.reg[%d]) %% 0x100000000
+    ]]):format(pc, inst.rs1, inst.rd, inst.rs2)
 end
 
-RISCV.atomic_opcodes[1] = function(self, inst) -- AMOSWAP.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = self.reg[inst.rs2]
-    return "AMOSWAP.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[1] = function(pc, inst) -- AMOSWAP.W
+    return ([[
+        -- %08X: AMOSWAP.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val = self.mem32[addr / 4]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = self.reg[%d]
+    ]]):format(pc, inst.rs1, inst.rd, inst.rs2)
 end
 
-RISCV.atomic_opcodes[2] = function(self, inst) -- LR.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction")
-    else self.reg[inst.rd] = self.mem32[addr / 4] end
-    self.atomic_rs[addr / 4] = true
-    return "LR.W x" .. inst.rd .. ", x" .. inst.rs1
+RISCV.atomic_opcodes[2] = function(pc, inst) -- LR.W
+    return ([[
+        -- %08X: LR.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction")
+        else self.reg[%d] = self.mem32[addr / 4] end
+        self.atomic_rs[addr / 4] = true
+    ]]):format(pc, inst.rs1, inst.rd)
 end
 
-RISCV.atomic_opcodes[3] = function(self, inst) -- SC.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds write at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction")
-    elseif self.atomic_rs[addr / 4] then
-        self.mem32[addr / 4] = self.reg[inst.rs2]
-        self.reg[inst.rd] = 0
-    else
-        self.reg[inst.rd] = 1
-    end
-    self.atomic_rs[addr / 4] = nil
-    return "SC.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[3] = function(pc, inst) -- SC.W
+    return ([[
+        -- %08X: SC.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction")
+        elseif self.atomic_rs[addr / 4] then
+            self.mem32[addr / 4] = self.reg[%d]
+            self.reg[%d] = 0
+        else
+            self.reg[%d] = 1
+        end
+        self.atomic_rs[addr / 4] = nil
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd, inst.rd)
 end
 
-RISCV.atomic_opcodes[4] = function(self, inst) -- AMOXOR.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = bit32.bxor(val, self.reg[inst.rs2])
-    return "AMOXOR.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[4] = function(pc, inst) -- AMOXOR.W
+    return ([[
+        -- %08X: AMOXOR.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val = self.mem32[addr / 4]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = bit32.bxor(val, self.reg[%d])
+    ]]):format(pc, inst.rs1, inst.rd, inst.rs2)
 end
 
-RISCV.atomic_opcodes[8] = function(self, inst) -- AMOOR.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = bit32.bor(val, self.reg[inst.rs2])
-    return "AMOOR.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[8] = function(pc, inst) -- AMOOR.W
+    return ([[
+        -- %08X: AMOOR.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val = self.mem32[addr / 4]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = bit32.bor(val, self.reg[%d])
+    ]]):format(pc, inst.rs1, inst.rd, inst.rs2)
 end
 
-RISCV.atomic_opcodes[12] = function(self, inst) -- AMOAND.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = bit32.band(val, self.reg[inst.rs2])
-    return "AMOAND.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[12] = function(pc, inst) -- AMOAND.W
+    return ([[
+        -- %08X: AMOAND.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val = self.mem32[addr / 4]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = bit32.band(val, self.reg[%d])
+    ]]):format(pc, inst.rs1, inst.rd, inst.rs2)
 end
 
-RISCV.atomic_opcodes[16] = function(self, inst) -- AMOMIN.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = signed(val) < signed(self.reg[inst.rs2]) and val or self.reg[inst.rs2]
-    return "AMOMIN.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[16] = function(pc, inst) -- AMOMIN.W
+    return ([[
+        -- %08X: AMOMIN.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val, val2 = self.mem32[addr / 4], self.reg[%d]
+        local ra, rb = val, val2
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        self.reg[%d] = val
+        self.mem32[addr / 4] = ra < rb and val or val2
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.atomic_opcodes[20] = function(self, inst) -- AMOMAX.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = signed(val) > signed(self.reg[inst.rs2]) and val or self.reg[inst.rs2]
-    return "AMOMAX.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[20] = function(pc, inst) -- AMOMAX.W
+    return ([[
+        -- %08X: AMOMAX.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val, val2 = self.mem32[addr / 4], self.reg[%d]
+        local ra, rb = val, val2
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        self.reg[%d] = val
+        self.mem32[addr / 4] = ra > rb and val or val2
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.atomic_opcodes[24] = function(self, inst) -- AMOMINU.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = math.min(val, self.reg[inst.rs2])
-    return "AMOMINU.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[24] = function(pc, inst) -- AMOMINU.W
+    return ([[
+        -- %08X: AMOMINU.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val, val2 = self.mem32[addr / 4], self.reg[%d]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = val < val2 and val or val2
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.atomic_opcodes[28] = function(self, inst) -- AMOMAXU.W
-    local addr = self.reg[inst.rs1]
-    if addr > ffi.sizeof(self.mem) then error(("out of bounds read at %08x"):format(addr)) end
-    if addr % 4 ~= 0 then error("unaligned AMO instruction") end
-    local val = self.mem32[addr / 4]
-    self.reg[inst.rd] = val
-    self.mem32[addr / 4] = math.max(val, self.reg[inst.rs2])
-    return "AMOMAXU.W x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.atomic_opcodes[28] = function(pc, inst) -- AMOMAXU.W
+    return ([[
+        -- %08X: AMOMAXU.W
+        local addr = self.reg[%d]
+        if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
+        local val, val2 = self.mem32[addr / 4], self.reg[%d]
+        self.reg[%d] = val
+        self.mem32[addr / 4] = val > val2 and val or val2
+    ]]):format(pc, inst.rs1, inst.rs2, inst.rd)
 end
 
-function RISCV:clock()
-    if self.pc >= 33554432 then error("pc out of bounds") end
-    local oldpc = self.pc
-    local inst = self.mem32[self.pc / 4]
-    self.pc = self.pc + 4
-    local mode = opcode_modes[bit32.band(inst, 0x7F)]
-    if not mode then
-        error(("Unknown opcode %02X"):format(bit32.band(inst, 0x7F)))
-        return
-    end
-    inst = mode(inst)
-    --print(textutils.serialize(inst))
-    local f = self.opcodes[inst.opcode]
-    local op
-    if type(f) == "function" then op = f(self, inst)
-    elseif type(f) == "table" then
-        if not f[inst.funct3] then error("Unknown function " .. inst.funct3)
-        elseif inst.opcode == 0x33 and bit32.btest(inst.funct7, 1) then op = self.mult_opcodes[inst.funct3](self, inst)
-        elseif inst.opcode == 0x2F and inst.funct3 == 2 then op = self.atomic_opcodes[bit32.rshift(inst.funct7, 2)](self, inst)
-        else op = f[inst.funct3](self, inst) end
-    else error("Unknown opcode " .. inst.opcode) end
-    --if op then print(("%08x  %s"):format(oldpc, op)) end
-end
+RISCV.traces = setmetatable({}, {__index = function(trace, pc)
+    local self = RISCV
+    local base = pc
+    local chunk = ([[
+    local math, bit32 = math, bit32
+    return function(self)
+        if self.halt then return end
+        self.branches = self.branches + 1
+        if self.branches > self.branchesLimit then coroutine.yield() end
+        self.pc = %d
+    ]]):format(pc)
+    repeat
+        if pc >= 33554432 then error("pc out of bounds") end
+        if pc % 4 ~= 0 then error(("unaligned jump to %08X"):format(pc)) end
+        local inst = self.mem32[pc / 4]
+        if inst == 0xc0001073 then chunk = chunk .. "self.halt = true\n" break end
+        pc = pc + 4
+        local mode = opcode_modes[bit32.band(inst, 0x7F)]
+        if not mode then
+            error(("Unknown opcode %02X at %08X"):format(bit32.band(inst, 0x7F), pc - 4))
+            return
+        end
+        inst = mode(inst)
+        --print(textutils.serialize(inst))
+        local f = self.opcodes[inst.opcode]
+        local op, isBranch
+        if type(f) == "function" then op, isBranch = f(pc, inst)
+        elseif type(f) == "table" then
+            if not f[inst.funct3] then print("Unknown function " .. inst.funct3)
+            elseif inst.opcode == 0x33 and bit32.btest(inst.funct7, 1) then op, isBranch = self.mult_opcodes[inst.funct3](pc, inst)
+            elseif inst.opcode == 0x2F and inst.funct3 == 2 then op, isBranch = self.atomic_opcodes[bit32.rshift(inst.funct7, 2)](pc, inst)
+            else op, isBranch = f[inst.funct3](pc, inst) end
+        else error("Unknown opcode " .. inst.opcode .. " at " .. (pc - 4)) end
+        chunk = chunk .. op
+    until isBranch
+    chunk = chunk .. "end"
+    --print(chunk)
+    local fn = assert(load(chunk, ("@%08X"):format(base)))()
+    trace[base] = fn
+    return fn
+end})
 
 function RISCV:run(cycles)
-    for i = 1, cycles do if self.halt then return end self:clock() --[[sleep(0.05)]] end
+    self.branches = 0
+    self.branchesLimit = cycles
+    if self.coro then
+        assert(coroutine.resume(self.coro))
+    else
+        self.coro = coroutine.create(self.traces[self.pc])
+        assert(coroutine.resume(self.coro, self))
+    end
+    if coroutine.status(self.coro) == "dead" then self.coro = nil end
 end
 
 function RISCV:call(addr, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
     --print(("Call: %08x"):format(addr))
+    self.coro = nil
     local oldra = self.reg[1]
     local oldreg = {}
     local oldpc = self.pc
@@ -568,7 +752,10 @@ function RISCV:call(addr, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
     if arg7 then oldreg[7], self.reg[16] = self.reg[16], arg7 end
     self.reg[1] = oldpc
     self.pc = addr
-    while self.pc ~= oldpc do if self.halt then return end self:clock() end
+    local oldtrace = rawget(self.traces, oldpc)
+    self.traces[oldpc] = function() self.pc = oldpc end
+    while self.pc ~= oldpc do if self.halt then return end self:run(1) end
+    self.traces[oldpc] = oldtrace
     local res = self.reg[10]
     self.reg[1] = oldra
     for k, v in pairs(oldreg) do self.reg[k+9] = v end

@@ -25,7 +25,7 @@ local function signed(n) if n >= 0x80000000 then return n - 0x100000000 end retu
 local function value(L, idx)
     idx = signed(idx)
     if idx == -1001000 then return debug.getregistry()
-    elseif idx < -1001000 then return L.cf and L.cf.upvalues[-idx - 1001000]
+    elseif idx < -1001000 then return luastate.lua_value(L.cf and L.cf.upvalues[-idx - 1001000], L.cpu)
     elseif idx < 0 then idx = L.stack.n + idx + 1 end
     return luastate.lua_value(L.stack[idx], L.cpu)
 end
@@ -33,7 +33,7 @@ end
 local function rawvalue(L, idx)
     idx = signed(idx)
     if idx == -1001000 then return luastate.table(debug.getregistry())
-    elseif idx < -1001000 then return luastate.stack_value(L.cf and L.cf.upvalues[-idx - 1001000])
+    elseif idx < -1001000 then return L.cf and L.cf.upvalues[-idx - 1001000]
     elseif idx < 0 then idx = L.stack.n + idx + 1 end
     return L.stack[idx]
 end
@@ -240,7 +240,7 @@ function lua52:lua_tolstring(_L, idx, _ptr)
     local v = value(L, idx)
     -- TODO: numbers to string
     if type(v) ~= "string" then return void end
-    ffi.copy(self.mem + _ptr, v)
+    self.fficopy(self.mem + _ptr, v)
     return void
 end
 
@@ -312,12 +312,12 @@ function lua52:lua_pushunsigned(_L, n)
 end
 
 function lua52:lua_pushlstring(_L, _s, len)
-    luastate.states[_L]:push(ffi.string(self.mem + _s, len))
+    luastate.states[_L]:push(self.ffistring(self.mem + _s, len))
     return _s
 end
 
 function lua52:lua_pushstring(_L, _s)
-    luastate.states[_L]:push(ffi.string(self.mem + _s))
+    luastate.states[_L]:push(self.ffistring(self.mem + _s))
     return _s
 end
 
@@ -349,7 +349,7 @@ end
 
 function lua52:lua_getglobal(_L, _var)
     local L = luastate.states[_L]
-    L:push(_G[ffi.string(self.mem + _var)])
+    L:push(_G[self.ffistring(self.mem + _var)])
     return void
 end
 
@@ -361,7 +361,7 @@ function lua52:lua_gettable(_L, idx)
 end
 
 function lua52:lua_getfield(_L, idx, _k)
-    local k = ffi.string(self.mem + _k)
+    local k = self.ffistring(self.mem + _k)
     local L = luastate.states[_L]
     local t = value(L, idx)
     L:push(t[k])
@@ -427,7 +427,7 @@ end
 function lua52:lua_setglobal(_L, _var)
     local L = luastate.states[_L]
     local v = L:pop()
-    _G[ffi.string(self.mem + _var)] = v
+    _G[self.ffistring(self.mem + _var)] = v
     return void
 end
 
@@ -441,7 +441,7 @@ function lua52:lua_settable(_L, idx)
 end
 
 function lua52:lua_setfield(_L, idx, _k)
-    local k = ffi.string(self.mem + _k)
+    local k = self.ffistring(self.mem + _k)
     local L = luastate.states[_L]
     local t = value(L, idx)
     t[k] = L:pop()
