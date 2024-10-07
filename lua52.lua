@@ -288,7 +288,15 @@ function lua52:lua_arith(_L, op)
     return void
 end
 
+function lua52:lua_rawequal(_L, idx1, idx2)
+    local L = luastate.states[_L]
+    return rawequal(value(L, idx1), value(L, idx2))
+end
 
+function lua52:lua_compare(_L, idx1, idx2, op)
+    local L = luastate.states[_L]
+    
+end
 
 function lua52:lua_pushnil(_L)
     luastate.states[_L]:push(nil)

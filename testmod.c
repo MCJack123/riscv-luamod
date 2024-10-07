@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <locale.h>
+#include <dirent.h>
 
 static int test_foo(lua_State *L) {
     errno = lua_tointeger(L, 1);
@@ -28,10 +29,27 @@ static int test_isdigit(lua_State *L) {
     return 3;
 }
 
+static int test_list(lua_State *L) {
+    DIR * dir = opendir("/riscv-luamod");
+    if (dir) {
+        lua_newtable(L);
+        struct dirent * d;
+        for (int i = 1; (d = readdir(dir)) != NULL; i++) {
+            lua_pushstring(L, d->d_name);
+            lua_rawseti(L, -2, i);
+        }
+        closedir(dir);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
 static luaL_Reg lib[] = {
     {"foo", test_foo},
     {"str", test_str},
     {"isdigit", test_isdigit},
+    {"list", test_list},
     {NULL, NULL}
 };
 

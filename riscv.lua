@@ -457,7 +457,9 @@ end
 RISCV.opcodes[0x73] = function(pc, inst) -- ECALL/EBREAK
     if inst.funct3 ~= 0 then return ("-- %08X: ECALL Zicsr\n"):format(pc) end -- Zicsr not implemented
     if inst.imm == 0 then return [=[
-        if self.syscalls[self.reg[17]] then self.reg[10] = self.syscalls[self.reg[17]](self, table.unpack(self.reg, 10, 16)) end
+        --print("Syscall: " .. self.reg[17])
+        if self.syscalls[self.reg[17]] then self.reg[10] = self.syscalls[self.reg[17]](self, table.unpack(self.reg, 10, 16))
+        else self.reg[10] = -38 end
         if self.halt then return end
     ]=]
     elseif inst.imm == 0x302 then return [=[
@@ -570,8 +572,8 @@ RISCV.atomic_opcodes[1] = function(pc, inst) -- AMOSWAP.W
         local addr = self.reg[%d]
         if addr %% 4 ~= 0 then error("unaligned AMO instruction") end
         local val = self.mem32[addr / 4]
-        self.reg[%d] = val
         self.mem32[addr / 4] = self.reg[%d]
+        self.reg[%d] = val
     ]]):format(pc, inst.rs1, inst.rd, inst.rs2)
 end
 
@@ -872,7 +874,7 @@ if ... ~= "riscv" then
     local name, fn = ...
     local test = loadmodule(name)
     local ok, err = xpcall(function(...)
-        print(test[fn](...))
+        require "cc.pretty".pretty_print(test[fn](...))
         --print(test.crc32()(os.about()))
     end, function(msg)
         return msg .. "\n" .. dump(RISCV, RISCV.modules, RISCV.endAddr)
