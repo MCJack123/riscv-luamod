@@ -38,6 +38,97 @@ local fds = {
     }
 }
 
+function syscalls:mkdirat(dfd, _pathname, mode)
+    local path = self.ffistring(self.mem + _pathname)
+    if not path:match "^/" then
+        if dfd == 4294967196 then -- -100
+            path = fs.combine(shell and shell.dir() or "/", path)
+        else
+            local fd = fds[dfd]
+            if not fd then return -errno.EBADF end
+            if fd.type ~= "dir" then return -errno.ENOTDIR end
+            path = fs.combine(fd.path, path)
+        end
+    end
+    local ok, err = pcall(fs.makeDir, path)
+    if not ok then
+        return -errno.EIO
+    end
+    return 0
+end
+
+function syscalls:unlinkat(dfd, _pathname, flag)
+    local path = self.ffistring(self.mem + _pathname)
+    if not path:match "^/" then
+        if dfd == 4294967196 then -- -100
+            path = fs.combine(shell and shell.dir() or "/", path)
+        else
+            local fd = fds[dfd]
+            if not fd then return -errno.EBADF end
+            if fd.type ~= "dir" then return -errno.ENOTDIR end
+            path = fs.combine(fd.path, path)
+        end
+    end
+    if bit32.btest(flag, 0x200) then -- AT_REMOVEDIR
+        if fs.isDir(path) then
+            if #fs.list(path) == 0 then
+                local ok, err = pcall(fs.delete, path)
+                if not ok then
+                    if err:match "Permission denied" or err:match "Access denied" then return -errno.EROFS
+                    else return -errno.EIO end
+                end
+                return 0
+            else
+                return -errno.EEXIST
+            end
+        else
+            return -errno.ENOTDIR
+        end
+    else
+        if fs.isDir(path) then
+            return -errno.EISDIR
+        else
+            local ok, err = pcall(fs.delete, path)
+            if not ok then
+                if err:match "Permission denied" or err:match "Access denied" then return -errno.EROFS
+                else return -errno.EIO end
+            end
+            return 0
+        end
+    end
+end
+
+function syscalls:renameat(olddfd, _oldname, newdfd, _newname)
+    local oldpath = self.ffistring(self.mem + _oldname)
+    if not oldpath:match "^/" then
+        if olddfd == 4294967196 then -- -100
+            oldpath = fs.combine(shell and shell.dir() or "/", oldpath)
+        else
+            local fd = fds[olddfd]
+            if not fd then return -errno.EBADF end
+            if fd.type ~= "dir" then return -errno.ENOTDIR end
+            oldpath = fs.combine(fd.path, oldpath)
+        end
+    end
+    local newpath = self.ffistring(self.mem + _newname)
+    if not newpath:match "^/" then
+        if newdfd == 4294967196 then -- -100
+            newpath = fs.combine(shell and shell.dir() or "/", newpath)
+        else
+            local fd = fds[newdfd]
+            if not fd then return -errno.EBADF end
+            if fd.type ~= "dir" then return -errno.ENOTDIR end
+            newpath = fs.combine(fd.path, newpath)
+        end
+    end
+    local ok, err = pcall(fs.rename, oldpath, newpath)
+    if not ok then
+        if err:match "Permission denied" or err:match "Access denied" then return -errno.EROFS
+        else return -errno.EIO end
+    end
+    return 0
+end
+
 function syscalls:openat(dirfd, _path, flags)
     local path = self.ffistring(self.mem + _path)
     if not path:match "^/" then
@@ -159,6 +250,58 @@ function syscalls:getdents64(fd, _dirp, count)
         dir.pos = dir.pos + 1
     end
     return _dirp - s
+end
+
+function syscalls:lseek(fd, offset_high, offset_low, _result, whence)
+    local file = fds[fd]
+    if not file then return -errno.EBADF end
+    if file.type ~= "file" then return -errno.EISDIR end
+    local offset = offset_high * 0x100000000 + offset_low
+    if whence == 0 then whence = "set"
+    elseif whence == 1 then whence = "cur"
+    elseif whence == 2 then whence = "end"
+    else return -errno.EINVAL end
+    local ok, pos = pcall(file.handle.seek, file.handle, offset, whence)
+    if not ok then
+        return -errno.EIO
+    end
+    self.mem[_result] = bit32.extract(pos, 0, 8)
+    self.mem[_result+1] = bit32.extract(pos, 8, 8)
+    self.mem[_result+2] = bit32.extract(pos, 16, 8)
+    self.mem[_result+3] = bit32.extract(pos, 24, 8)
+    return 0
+end
+
+function syscalls:read(fd, _buf, count)
+    local file = fds[fd]
+    if not file then return -errno.EBADF end
+    if file.type ~= "file" then return -errno.EISDIR end
+    if not file.handle.read then return -errno.EINVAL end
+    local ok, data = pcall(file.handle.read, file.handle, count)
+    if not ok then return -errno.EIO end
+    if data == nil then return 0 end
+    self.fficopy(self.mem + _buf, data)
+    return #data
+end
+
+function syscalls:write(fd, _buf, count)
+    local file = fds[fd]
+    if not file then return -errno.EBADF end
+    if file.type ~= "file" then return -errno.EISDIR end
+    if not file.handle.write then return -errno.EINVAL end
+    local data = self.ffistring(self.mem + _buf, count)
+    local ok = pcall(file.handle.write, file.handle, data)
+    if not ok then return -errno.EIO end
+    return count
+end
+
+function syscalls:fsync(fd)
+    local file = fds[fd]
+    if not file then return -errno.EBADF end
+    if file.type ~= "file" then return -errno.EISDIR end
+    if not file.handle.flush then return -errno.EINVAL end
+    file.handle:flush()
+    return 0
 end
 
 function syscalls:statx(dirfd, _pathname, flags, mask, _statxbuf)
@@ -308,9 +451,17 @@ function syscalls:lua52(opt, ...)
 end
 
 local syscall_list = {
+    [34] = "mkdirat",
+    [35] = "unlinkat",
+    [38] = "renameat",
     [56] = "openat",
     [57] = "close",
     [61] = "getdents64",
+    [62] = "lseek",
+    [63] = "read",
+    [64] = "write",
+    [82] = "fsync",
+    [83] = "fsync",
     [214] = "brk",
     [222] = "mmap2",
     [261] = "prlimit64",
