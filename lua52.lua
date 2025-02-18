@@ -66,6 +66,7 @@ function lua52:lua_version(_L)
 end
 
 function lua52:lua_absindex(_L, idx)
+    if signed(idx) <= -1001000 then return idx end
     idx = signed(idx)
     local L = luastate.states[_L]
     if idx < 0 then idx = L.stack.n + idx + 1 end
@@ -386,6 +387,10 @@ end
 function lua52:lua_rawgeti(_L, idx, n)
     local L = luastate.states[_L]
     local t = value(L, idx)
+    if type(t) ~= "table" then
+        for i = 1, #L.stack do print(i, L.stack[i]) end
+        error("Not a table at " .. idx .. ":", t)
+    end
     L:push(rawget(t, n))
     return void
 end
